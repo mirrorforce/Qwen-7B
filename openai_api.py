@@ -1,9 +1,9 @@
 # coding=utf-8
-# Implements API for ChatGLM2-6B in OpenAI's format. (https://platform.openai.com/docs/api-reference/chat)
+# Implements API for Qwen-7B in OpenAI's format. (https://platform.openai.com/docs/api-reference/chat)
 # Usage: python openai_api.py
 # Visit http://localhost:8000/docs for documents.
 
-
+from argparse import ArgumentParser
 import time
 import torch
 import uvicorn
@@ -12,11 +12,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional, Union
-from transformers import AutoTokenizer, AutoModel
-from sse_starlette.sse import ServerSentEvent, EventSourceResponse
-
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from transformers.generation import GenerationConfig
+from sse_starlette.sse import ServerSentEvent, EventSourceResponse
 
 
 @asynccontextmanager
@@ -37,14 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# langchain openai need this parameter
-_usage = {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
-}
 
-    
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
@@ -77,35 +68,26 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     max_length: Optional[int] = None
     stream: Optional[bool] = False
-    stop: Optional[Union[str, List[str]]]
+    stop: Optional[List[str]] = []
 
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Union[Literal["stop", "length"], str]
+    finish_reason: Literal["stop", "length"]
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
     delta: DeltaMessage
-    finish_reason: Union[Literal["stop", "length"], str]
+    finish_reason: Optional[Literal["stop", "length"]]
 
-
-class usage(BaseModel):
-    """
-    langchain openai request need this parameter
-    """
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
 
 class ChatCompletionResponse(BaseModel):
     model: str
     object: Literal["chat.completion", "chat.completion.chunk"]
     choices: List[Union[ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice]]
     created: Optional[int] = Field(default_factory=lambda: int(time.time()))
-    usage: usage
 
 
 @app.get("/v1/models", response_model=ModelList)
@@ -122,57 +104,64 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid request")
     query = request.messages[-1].content
-
+    stop_words = request.stop
+    stop_words.extend(list(map(lambda x: x[1:], filter(lambda x: x.startswith("\n"), stop_words))))
     prev_messages = request.messages[:-1]
-    if len(prev_messages) > 0 and prev_messages[0].role == "system":
-        query = prev_messages.pop(0).content + query
+    # Temporarily, the system role does not work as expected. We advise that you write the setups for role-play in your query.
+    # if len(prev_messages) > 0 and prev_messages[0].role == "system":
+    #     query = prev_messages.pop(0).content + query
 
     history = []
     if len(prev_messages) % 2 == 0:
         for i in range(0, len(prev_messages), 2):
             if prev_messages[i].role == "user" and prev_messages[i+1].role == "assistant":
                 history.append([prev_messages[i].content, prev_messages[i+1].content])
+            else:
+                raise HTTPException(status_code=400, detail="Invalid request.")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid request.")
 
     if request.stream:
-        generate = predict(query, history, request.model)
+        generate = predict(query, history, request.model, stop_words)
         return EventSourceResponse(generate, media_type="text/event-stream")
 
-    print(query)
-    # print(history)
-    response, _ = model.chat(tokenizer, query, history=history)
-
-    finish_reason = "stop"
-
-    if request.stop and type(request.stop) == list:
-        for _stop in request.stop:
-            if _stop in response:
-                response = response.split(_stop)[0]
-                finish_reason = _stop
+    if stop_words:
+        react_stop_words_tokens = [tokenizer.encode(stop_) for stop_ in stop_words]
+        response, _ = model.chat(tokenizer, query, history=history, stop_words_ids=react_stop_words_tokens)
+        for stop_ in stop_words:
+            if response.endswith(stop_):
+                response = response[:response.find(stop_)]
+    else:
+        response, _ = model.chat(tokenizer, query, history=history)
 
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(role="assistant", content=response),
-        finish_reason=finish_reason
+        finish_reason="stop"
     )
 
-    print(choice_data)
+    return ChatCompletionResponse(model=request.model, choices=[choice_data], object="chat.completion")
 
-    return ChatCompletionResponse(model=request.model, choices=[choice_data], object="chat.completion", usage=_usage)
 
-async def predict(query: str, history: List[List[str]], model_id: str):
+async def predict(query: str, history: List[List[str]], model_id: str, stop_words: List[str]):
     global model, tokenizer
-
+    assert stop_words == [], "in stream format, stop word is output"
     choice_data = ChatCompletionResponseStreamChoice(
         index=0,
         delta=DeltaMessage(role="assistant"),
         finish_reason=None
     )
     chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    yield "{}".format(chunk.json(exclude_unset=True, ensure_ascii=False))
+    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
     current_length = 0
+    if stop_words:
+        react_stop_words_tokens = [tokenizer.encode(stop_) for stop_ in stop_words]
+        response_generator = model.chat_stream(tokenizer, query, history=history, stop_words_ids=react_stop_words_tokens)
+    else:
+        response_generator = model.chat_stream(tokenizer, query, history=history)
 
-    for new_response, _ in model.stream_chat(tokenizer, query, history):
+    for new_response in response_generator:
         if len(new_response) == current_length:
             continue
 
@@ -185,7 +174,7 @@ async def predict(query: str, history: List[List[str]], model_id: str):
             finish_reason=None
         )
         chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-        yield "{}".format(chunk.json(exclude_unset=True, ensure_ascii=False))
+        yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
 
     choice_data = ChatCompletionResponseStreamChoice(
@@ -194,84 +183,44 @@ async def predict(query: str, history: List[List[str]], model_id: str):
         finish_reason="stop"
     )
     chunk = ChatCompletionResponse(model=model_id, choices=[choice_data], object="chat.completion.chunk")
-    yield "{}".format(chunk.json(exclude_unset=True, ensure_ascii=False))
+    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
     yield '[DONE]'
 
+def _get_args():
+    parser = ArgumentParser()
+    parser.add_argument("-c", "--checkpoint-path", type=str, default='QWen/QWen-7B-Chat',
+                        help="Checkpoint name or path, default to %(default)r")
+    parser.add_argument("--cpu-only", action="store_true", help="Run demo with CPU only")
+    parser.add_argument("--server-port", type=int, default=8000,
+                        help="Demo server port.")
+    parser.add_argument("--server-name", type=str, default="127.0.0.1",
+                        help="Demo server name.")
 
-
-class CompletionResponseChoice(BaseModel):
-    text: str
-    index: int = 0
-    logprobs: Optional[int] = 0
-    finish_reason: Union[Literal["stop", "length"], str]
-
-
-class CompletionRequest(BaseModel):
-    prompt: List[str]
-    model: Optional[str] = "chatGLM2-6B"
-    max_tokens: Optional[int] = 2048
-    temperature: Optional[float] = 0.95
-    top_p: Optional[float] = 0.7
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    logprobs: Optional[int] = 0
-    stop: Optional[Union[str, List[str]]]
-
-class CompletionResponse(BaseModel):
-    id: str = "chatGLM2-6B"
-    model: str = "chatGLM2-6B"
-    object: Union[Literal["stop", "length"], str]
-    choices: List[CompletionResponseChoice]
-    created: Optional[int] = Field(default_factory=lambda: int(time.time()))
-    usage: usage
-
-
-@app.post("/v1/completions", response_model=CompletionResponse)
-async def create_completion(request: CompletionRequest):
-    global model, tokenizer
-    # if request.messages[-1].role != "user":
-    #     raise HTTPException(status_code=400, detail="Invalid request")
-    query = request.prompt[-1]
-    # max_tokens = request.max_tokens
-    # temperature = request.temperature
-    # top_p = request.top_p
-    # n = request.n
-
-    print(query)
-    response, _ = model.chat(tokenizer, query, history=[])
-
-    finish_reason = "stop"
-
-    if request.stop and type(request.stop) == list:
-        for _stop in request.stop:
-            if _stop in response:
-                response = response.split(_stop)[0]
-                finish_reason = _stop
-
-        
-    choice_data = CompletionResponseChoice(
-        text=response,
-        finish_reason=finish_reason
-    )
-
-    print(choice_data)
-
-    return CompletionResponse(choices=[choice_data], object=finish_reason, usage=_usage)
-
-
-
+    args = parser.parse_args()
+    return args
 
 
 if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("QWen/QWen-7B-Chat", trust_remote_code=True)
+    args = _get_args()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.checkpoint_path, trust_remote_code=True, resume_download=True,
+    )
+
+    if args.cpu_only:
+        device_map = "cpu"
+    else:
+        device_map = "auto"
+
     model = AutoModelForCausalLM.from_pretrained(
-        "QWen/QWen-7B-Chat",
-        device_map="cuda:0",
+        args.checkpoint_path,
+        device_map=device_map,
         trust_remote_code=True,
-        bf16=True,
-        use_flash_attn=False
+        resume_download=True,
     ).eval()
-    model.generation_config = GenerationConfig.from_pretrained("QWen/QWen-7B-Chat", trust_remote_code=True)
 
+    model.generation_config = GenerationConfig.from_pretrained(
+        args.checkpoint_path, trust_remote_code=True, resume_download=True,
+    )
 
-    uvicorn.run(app, host='0.0.0.0', port=8000, workers=1)
+    uvicorn.run(app, host=args.server_name, port=args.server_port, workers=1)
