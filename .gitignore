@@ -11,4 +11,9 @@ build
 /private/
 
 
-./venv/
+venv
+queue
+ipynb
+data
+openai.mini
+bilibili-api
